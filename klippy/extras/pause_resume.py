@@ -28,8 +28,6 @@ class PauseResume:
     def handle_ready(self):
         self.v_sd = self.printer.lookup_object('virtual_sdcard', None)
     def _handle_web_request(self, web_request):
-        if web_request.get_method() != 'POST':
-            raise web_request.error("Invalid Request Method")
         path = web_request.get_path()
         if path == "pause_resume/cancel":
             script = "CANCEL_PRINT"
