@@ -45,11 +45,15 @@ class Sentinel:
 
 class WebRequest:
     error = WebRequestError
-    def __init__(self, base_request):
+    def __init__(self, client_conn, base_request):
+        self.client_conn = client_conn
         self.id = base_request['id']
         self.path = base_request['path']
         self.args = base_request['args']
         self.response = None
+
+    def get_client_connection(self):
+        return self.client_conn
 
     def get(self, item, default=Sentinel):
         if item not in self.args:
@@ -170,6 +174,9 @@ class ClientConnection:
                 pass
             self.server.pop_client(self.uid)
 
+    def is_closed(self):
+        return self.fd_handle is None
+
     def process_received(self, eventtime):
         try:
             data = self.sock.recv(4096)
@@ -191,7 +198,7 @@ class ClientConnection:
             logging.debug(
                 "webhooks: Request received: %s" % (req))
             try:
-                web_request = WebRequest(json_loads_byteified(req))
+                web_request = WebRequest(self, json_loads_byteified(req))
             except Exception:
                 logging.exception(
                     "webhooks: Error decoding Server Request %s"
@@ -257,20 +264,10 @@ class WebHooks:
 
         # Register Events
         printer.register_event_handler(
-            "klippy:connect", self._handle_connect)
-        printer.register_event_handler(
             "klippy:shutdown", self._notify_shutdown)
-
-    def _handle_connect(self):
-        gcode = self.printer.lookup_object('gcode')
-        gcode.register_output_handler(self._process_gcode_response)
 
     def _notify_shutdown(self):
         self.call_remote_method("set_klippy_shutdown")
-
-    def _process_gcode_response(self, gc_response):
-        self.call_remote_method(
-            "process_gcode_response", response=gc_response)
 
     def register_endpoint(self, path, callback):
         if path in self._endpoints:
@@ -317,6 +314,31 @@ class WebHooks:
         return {
             "action_call_remote_method": self._action_call_remote_method
         }
+
+class GCodeOutputHelper:
+    def __init__(self, printer):
+        self.printer = printer
+        wh = printer.lookup_object('webhooks')
+        wh.register_endpoint("subscribe_gcode_output",
+                               self._handle_subscribe_gcode_output)
+        self.is_registered = False
+        self.clients = {}
+    def _gcode_callback(self, msg):
+        for cconn, template in list(self.clients.items()):
+            if cconn.is_closed():
+                del self.clients[cconn]
+                continue
+            tmp = dict(template)
+            tmp['params'] = {'response': msg}
+            cconn.send(tmp)
+    def _handle_subscribe_gcode_output(self, web_request):
+        cconn = web_request.get_client_connection()
+        template = web_request.get('response_template', {})
+        self.clients[cconn] = template
+        if not self.is_registered:
+            gcode = self.printer.lookup_object('gcode')
+            gcode.register_output_handler(self._gcode_callback)
+            self.is_registered = True
 
 SUBSCRIPTION_REFRESH_TIME = .25
 
@@ -443,4 +465,5 @@ class StatusHandler:
 
 def add_early_printer_objects(printer):
     printer.add_object('webhooks', WebHooks(printer))
+    GCodeOutputHelper(printer)
     StatusHandler(printer)
