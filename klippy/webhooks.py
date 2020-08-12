@@ -352,6 +352,7 @@ class StatusHandler:
         self.subscriptions = {}
         self.subscription_timer = self.reactor.register_timer(
             self._batch_subscription_handler, self.reactor.NEVER)
+        self.clients = {}
 
         # Register events
         self.printer.register_event_handler(
@@ -384,8 +385,13 @@ class StatusHandler:
 
     def _batch_subscription_handler(self, eventtime):
         status = self._process_status_request(self.subscriptions, eventtime)
-        self.webhooks.call_remote_method(
-            "process_status_update", status=status)
+        for cconn, template in list(self.clients.items()):
+            if cconn.is_closed():
+                del self.clients[cconn]
+                continue
+            tmp = dict(template)
+            tmp['params'] = {'status': status}
+            cconn.send(tmp)
         return eventtime + SUBSCRIPTION_REFRESH_TIME
 
     def _process_status_request(self, requested_objects, eventtime):
@@ -417,11 +423,14 @@ class StatusHandler:
         web_request.send(result)
 
     def _handle_subscription_request(self, web_request):
+        # XXX - should allow per-client subscription lists
         args = web_request.get_args()
-        if args:
-            self.add_subscripton(args)
-        else:
+        if not args:
             raise web_request.error("Invalid argument")
+        self.add_subscripton(args)
+        cconn = web_request.get_client_connection()
+        template = web_request.get('response_template', {})
+        self.clients[cconn] = template
 
     def _handle_list_subscription_request(self, web_request):
         web_request.send(dict(self.subscriptions))
