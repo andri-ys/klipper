@@ -261,9 +261,12 @@ class ClientConnection:
 class WebHooks:
     def __init__(self, printer):
         self.printer = printer
-        self._endpoints = {"list_endpoints": self._handle_list_endpoints}
-        self.register_endpoint("info", self._handle_info_request)
-        self.register_endpoint("emergency_stop", self._handle_estop_request)
+        self._endpoints = {}
+        self.register_endpoint("api_server/list_endpoints",
+                               self._handle_list_endpoints)
+        self.register_endpoint("api_server/info", self._handle_info_request)
+        self.register_endpoint("api_server/emergency_stop",
+                               self._handle_estop_request)
         self.sconn = ServerSocket(self, printer)
 
     def register_endpoint(self, path, callback):
@@ -308,7 +311,7 @@ class GCodeOutputHelper:
     def __init__(self, printer):
         self.printer = printer
         wh = printer.lookup_object('webhooks')
-        wh.register_endpoint("subscribe_gcode_output",
+        wh.register_endpoint("api_server/subscribe_gcode_output",
                                self._handle_subscribe_gcode_output)
         self.is_registered = False
         self.clients = {}
@@ -350,12 +353,13 @@ class StatusHandler:
             "gcode:request_restart", self._handle_restart)
 
         # Register webhooks
-        webhooks.register_endpoint("objects/list", self._handle_object_request)
-        webhooks.register_endpoint("objects/status",
+        webhooks.register_endpoint("api_server/objects_list",
+                                   self._handle_object_request)
+        webhooks.register_endpoint("api_server/objects_status",
                                    self._handle_status_request)
-        webhooks.register_endpoint("objects/subscription",
+        webhooks.register_endpoint("api_server/objects_subscription",
                                    self._handle_subscription_request)
-        webhooks.register_endpoint("objects/list_subscription",
+        webhooks.register_endpoint("api_server/objects_list_subscription",
                                    self._handle_list_subscription_request)
 
     def _handle_ready(self):
@@ -461,6 +465,7 @@ class StatusHandler:
             self.reactor.update_timer(self.subscription_timer, self.reactor.NOW)
             self.timer_started = True
 
+# XXX - should rename file to api_server.py and module to 'api_server'
 def add_early_printer_objects(printer):
     printer.add_object('webhooks', WebHooks(printer))
     GCodeOutputHelper(printer)
