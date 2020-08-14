@@ -90,11 +90,16 @@ class DeltaCalibrate:
         # Calculate default probing points
         radius = config.getfloat('radius', above=0.)
         points = [(0., 0.)]
-        scatter = [.95, .90, .85, .70, .75, .80]
-        for i in range(6):
-            r = math.radians(90. + 60. * i)
-            dist = radius * scatter[i]
+        #scatter = [.95, .90, .85, .70, .75, .80]
+        
+        extra_count = config.getint('samples', 6, minval=2)
+        
+        for i in range(extra_count):
+            r = math.radians(90. + (360. / extra_count) * i)
+            dist = radius # * scatter[i]
             points.append((math.cos(r) * dist, math.sin(r) * dist))
+            #dist = dist * .50
+            #points.append((math.cos(r) * dist, math.sin(r) * dist))
         self.probe_helper = probe.ProbePointsHelper(
             config, self.probe_finalize, default_points=points)
         self.probe_helper.minimum_points(3)
@@ -224,6 +229,27 @@ class DeltaCalibrate:
     cmd_DELTA_CALIBRATE_help = "Delta calibration script"
     def cmd_DELTA_CALIBRATE(self, gcmd):
         self.probe_helper.start_probe(gcmd)
+        
+        sum = 0
+        count = len(self.probe_helper.results)
+        for i in range(count):
+            x = self.probe_helper.results[i][0]
+            y = self.probe_helper.results[i][1]
+            z = self.probe_helper.results[i][2]
+            self.gcode.respond_info("%2d. x:%.2f, y:%.2f, z : %.6f" % (i, x, y, z))
+            sum += z
+        avg = sum / count
+        
+        sd_sum = 0
+        for i in range(count):
+            z = self.probe_helper.results[i][2]
+            sd_sum += pow(z - avg, 2.)
+        sd = (sd_sum / count) ** 0.5
+        
+        self.gcode.respond_info("probe count : %d" % (count))
+        self.gcode.respond_info("average : %.6f" % (avg))
+        self.gcode.respond_info("stdev : %.6f" % (sd))
+        # self.gcode.respond_info("probe result : %.6f" % (self.probe_helper.results[0][2]))
     def add_manual_height(self, height):
         # Determine current location of toolhead
         toolhead = self.printer.lookup_object('toolhead')
