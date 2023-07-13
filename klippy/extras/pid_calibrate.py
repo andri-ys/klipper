@@ -26,11 +26,10 @@ class PIDCalibrate:
         calibrate = ControlAutoTune(heater, target)
         old_control = heater.set_control(calibrate)
         try:
-            heater.set_temp(target)
+            pheaters.set_temperature(heater, target, True)
         except self.printer.command_error as e:
             heater.set_control(old_control)
             raise
-        pheaters.wait_for_temperature(heater)
         heater.set_control(old_control)
         if write_file:
             calibrate.write_file('/tmp/heattest.txt')
@@ -130,14 +129,14 @@ class ControlAutoTune:
     def calc_final_pid(self):
         cycle_times = [(self.peaks[pos][1] - self.peaks[pos-2][1], pos)
                        for pos in range(4, len(self.peaks))]
-        midpoint_pos = sorted(cycle_times)[len(cycle_times)/2][1]
+        midpoint_pos = sorted(cycle_times)[len(cycle_times)//2][1]
         return self.calc_pid(midpoint_pos)
     # Offline analysis helper
     def write_file(self, filename):
         pwm = ["pwm: %.3f %.3f" % (time, value)
                for time, value in self.pwm_samples]
         out = ["%.3f %.3f" % (time, temp) for time, temp in self.temp_samples]
-        f = open(filename, "wb")
+        f = open(filename, "w")
         f.write('\n'.join(pwm + out))
         f.close()
 

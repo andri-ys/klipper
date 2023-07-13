@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2019  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, logging.handlers, threading, Queue as queue, time
+import logging, logging.handlers, threading, queue, time
 
 # Class to forward all messages through a queue to a background thread
 class QueueHandler(logging.Handler):
@@ -39,6 +39,9 @@ class QueueListener(logging.handlers.TimedRotatingFileHandler):
         self.bg_queue.put_nowait(None)
         self.bg_thread.join()
     def set_rollover_info(self, name, info):
+        if info is None:
+            self.rollover_info.pop(name, None)
+            return
         self.rollover_info[name] = info
     def clear_rollover_info(self):
         self.rollover_info.clear()

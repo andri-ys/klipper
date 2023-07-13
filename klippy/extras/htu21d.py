@@ -14,7 +14,7 @@ from . import bus
 #       HTU21D - Tested on Linux MCU.
 #       Si7013 - Untested
 #       Si7020 - Untested
-#       Si7021 - Untested
+#       Si7021 - Tested on Pico MCU
 #       SHT21  - Untested
 #
 ######################################################################
@@ -56,7 +56,7 @@ HTU21D_DEVICES = {
         'TEMP13_HUM10':[ .7, .5],
         'TEMP12_HUM08':[ .4, .4],
         'TEMP11_HUM11':[ .3, .7]},
-    'SI7021':{'id':0x14,
+    'SI7021':{'id':0x15,
         'TEMP14_HUM12':[.11,.12],
         'TEMP13_HUM10':[ .7, .5],
         'TEMP12_HUM08':[ .4, .4],
@@ -92,20 +92,25 @@ class HTU21D:
             raise config.error("Invalid HTU21D Resolution. Valid are %s"
                 % '|'.join(HTU21D_RESOLUTIONS.keys()))
         self.deviceId = config.get('sensor_type')
-        self.temp = self.humidity = 0.
+        self.temp = self.min_temp = self.max_temp = self.humidity = 0.
         self.sample_timer = self.reactor.register_timer(self._sample_htu21d)
         self.printer.add_object("htu21d " + self.name, self)
-        self.printer.register_event_handler("klippy:ready", self.handle_ready)
+        self.printer.register_event_handler("klippy:connect",
+                                            self.handle_connect)
 
-    def handle_ready(self):
+    def handle_connect(self):
         self._init_htu21d()
         self.reactor.update_timer(self.sample_timer, self.reactor.NOW)
 
     def setup_minmax(self, min_temp, max_temp):
-        pass
+        self.min_temp = min_temp
+        self.max_temp = max_temp
 
     def setup_callback(self, cb):
         self._callback = cb
+
+    def get_report_time_delta(self):
+        return self.report_time
 
     def _init_htu21d(self):
         # Device Soft Reset
@@ -194,7 +199,7 @@ class HTU21D:
                 if (self.humidity < 0):
                     #due to RH accuracy, measured value might be
                     # slightly less than 0 or more 100
-                    self.temp = 0
+                    self.humidity = 0
                 elif (self.humidity > 100):
                     self.humidity = 100
                 # Only for HTU21D & SHT21.
@@ -210,8 +215,14 @@ class HTU21D:
             self.temp = self.humidity = .0
             return self.reactor.NEVER
 
+        if self.temp < self.min_temp or self.temp > self.max_temp:
+            self.printer.invoke_shutdown(
+                "HTU21D temperature %0.1f outside range of %0.1f:%.01f"
+                % (self.temp, self.min_temp, self.max_temp))
+
         measured_time = self.reactor.monotonic()
-        self._callback(measured_time, self.temp)
+        print_time = self.i2c.get_mcu().estimated_print_time(measured_time)
+        self._callback(print_time, self.temp)
         return measured_time + self.report_time
 
     def _chekCRC8(self,data):
@@ -225,7 +236,7 @@ class HTU21D:
 
     def get_status(self, eventtime):
         return {
-            'temperature': self.temp,
+            'temperature': round(self.temp, 2),
             'humidity': self.humidity,
         }
 
