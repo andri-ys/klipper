@@ -1,11 +1,11 @@
 #!/usr/bin/env python2
 # Main code for host side printer firmware
 #
-# Copyright (C) 2016-2018  Kevin O'Connor <kevin@koconnor.net>
+# Copyright (C) 2016-2020  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import sys, os, optparse, logging, time, threading, collections, importlib
-import util, reactor, queuelogger, msgproto, homing
+import sys, os, gc, optparse, logging, time, collections, importlib
+import util, reactor, queuelogger, msgproto
 import gcode, configfile, pins, mcu, toolhead, webhooks
 
 message_ready = "Printer is ready"
@@ -22,13 +22,15 @@ command to reload the config and restart the host software.
 Printer is halted
 """
 
-message_protocol_error = """
-This type of error is frequently caused by running an older
-version of the firmware on the micro-controller (fix by
-recompiling and flashing the firmware).
+message_protocol_error1 = """
+This is frequently caused by running an older version of the
+firmware on the MCU(s). Fix by recompiling and flashing the
+firmware.
+"""
+
+message_protocol_error2 = """
 Once the underlying issue is corrected, use the "RESTART"
 command to reload the config and restart the host software.
-Protocol error connecting to printer
 """
 
 message_mcu_connect_error = """
@@ -47,11 +49,11 @@ Printer is shutdown
 
 class Printer:
     config_error = configfile.error
-    command_error = homing.CommandError
-    def __init__(self, bglogger, start_args):
+    command_error = gcode.CommandError
+    def __init__(self, main_reactor, bglogger, start_args):
         self.bglogger = bglogger
         self.start_args = start_args
-        self.reactor = reactor.Reactor()
+        self.reactor = main_reactor
         self.reactor.register_callback(self._connect)
         self.state_message = message_startup
         self.in_shutdown_state = False
@@ -59,7 +61,7 @@ class Printer:
         self.event_handlers = {}
         self.objects = collections.OrderedDict()
         # Init printer components that must be setup prior to config
-        for m in [webhooks, gcode]:
+        for m in [gcode, webhooks]:
             m.add_early_printer_objects(self)
     def get_start_args(self):
         return self.start_args
@@ -70,6 +72,8 @@ class Printer:
             category = "ready"
         elif self.state_message == message_startup:
             category = "startup"
+        elif self.in_shutdown_state:
+            category = "shutdown"
         else:
             category = "error"
         return self.state_message, category
@@ -82,7 +86,7 @@ class Printer:
             and self.start_args.get('debuginput') is not None):
             self.request_exit('error_exit')
     def add_object(self, name, obj):
-        if obj in self.objects:
+        if name in self.objects:
             raise self.config_error(
                 "Printer object '%s' already created" % (name,))
         self.objects[name] = obj
@@ -139,6 +143,33 @@ class Printer:
             m.add_printer_objects(config)
         # Validate that there are no undefined parameters in the config file
         pconfig.check_unused_options(config)
+    def _build_protocol_error_message(self, e):
+        host_version = self.start_args['software_version']
+        msg_update = []
+        msg_updated = []
+        for mcu_name, mcu in self.lookup_objects('mcu'):
+            try:
+                mcu_version = mcu.get_status()['mcu_version']
+            except:
+                logging.exception("Unable to retrieve mcu_version from mcu")
+                continue
+            if mcu_version != host_version:
+                msg_update.append("%s: Current version %s"
+                                  % (mcu_name.split()[-1], mcu_version))
+            else:
+                msg_updated.append("%s: Current version %s"
+                                   % (mcu_name.split()[-1], mcu_version))
+        if not msg_update:
+            msg_update.append("<none>")
+        if not msg_updated:
+            msg_updated.append("<none>")
+        msg = ["MCU Protocol error",
+               message_protocol_error1,
+               "Your Klipper version is: %s" % (host_version,),
+               "MCU(s) which should be updated:"]
+        msg += msg_update + ["Up-to-date MCU(s):"] + msg_updated
+        msg += [message_protocol_error2, str(e)]
+        return "\n".join(msg)
     def _connect(self, eventtime):
         try:
             self._read_config()
@@ -149,11 +180,11 @@ class Printer:
                 cb()
         except (self.config_error, pins.error) as e:
             logging.exception("Config error")
-            self._set_state("%s%s" % (str(e), message_restart))
+            self._set_state("%s\n%s" % (str(e), message_restart))
             return
         except msgproto.error as e:
             logging.exception("Protocol error")
-            self._set_state("%s%s" % (str(e), message_protocol_error))
+            self._set_state(self._build_protocol_error_message(e))
             util.dump_mcu_build()
             return
         except mcu.error as e:
@@ -163,8 +194,8 @@ class Printer:
             return
         except Exception as e:
             logging.exception("Unhandled exception during connect")
-            self._set_state("Internal error during connect: %s\n%s" % (
-                str(e), message_restart,))
+            self._set_state("Internal error during connect: %s\n%s"
+                            % (str(e), message_restart,))
             return
         try:
             self._set_state(message_ready)
@@ -174,8 +205,8 @@ class Printer:
                 cb()
         except Exception as e:
             logging.exception("Unhandled exception during ready callback")
-            self.invoke_shutdown("Internal error during ready callback: %s" % (
-                str(e),))
+            self.invoke_shutdown("Internal error during ready callback: %s"
+                                 % (str(e),))
     def run(self):
         systime = time.time()
         monotime = self.reactor.monotonic()
@@ -185,14 +216,22 @@ class Printer:
         try:
             self.reactor.run()
         except:
-            logging.exception("Unhandled exception during run")
-            return "error_exit"
+            msg = "Unhandled exception during run"
+            logging.exception(msg)
+            # Exception from a reactor callback - try to shutdown
+            try:
+                self.reactor.register_callback((lambda e:
+                                                self.invoke_shutdown(msg)))
+                self.reactor.run()
+            except:
+                logging.exception("Repeat unhandled exception during run")
+                # Another exception - try to exit
+                self.run_result = "error_exit"
         # Check restart flags
         run_result = self.run_result
         try:
             if run_result == 'firmware_restart':
-                for n, m in self.lookup_objects(module='mcu'):
-                    m.microcontroller_restart()
+                self.send_event("klippy:firmware_restart")
             self.send_event("klippy:disconnect")
         except:
             logging.exception("Unhandled exception during post run")
@@ -213,6 +252,8 @@ class Printer:
                 cb()
             except:
                 logging.exception("Exception during shutdown handler")
+        logging.info("Reactor garbage collection: %s",
+                     self.reactor.get_gc_stats())
     def invoke_async_shutdown(self, msg):
         self.reactor.register_async_callback(
             (lambda e: self.invoke_shutdown(msg)))
@@ -229,6 +270,21 @@ class Printer:
 ######################################################################
 # Startup
 ######################################################################
+
+def import_test():
+    # Import all optional modules (used as a build test)
+    dname = os.path.dirname(__file__)
+    for mname in ['extras', 'kinematics']:
+        for fname in os.listdir(os.path.join(dname, mname)):
+            if fname.endswith('.py') and fname != '__init__.py':
+                module_name = fname[:-3]
+            else:
+                iname = os.path.join(dname, mname, fname, '__init__.py')
+                if not os.path.exists(iname):
+                    continue
+                module_name = fname
+            importlib.import_module(mname + '.' + module_name)
+    sys.exit(0)
 
 def arg_dictionary(option, opt_str, value, parser):
     key, fname = "dictionary", value
@@ -247,6 +303,8 @@ def main():
     opts.add_option("-I", "--input-tty", dest="inputtty",
                     default='/tmp/printer',
                     help="input tty name (default is /tmp/printer)")
+    opts.add_option("-a", "--api-server", dest="apiserver",
+                    help="api server unix domain socket filename")
     opts.add_option("-l", "--logfile", dest="logfile",
                     help="write log to file instead of stderr")
     opts.add_option("-v", action="store_true", dest="verbose",
@@ -256,10 +314,15 @@ def main():
     opts.add_option("-d", "--dictionary", dest="dictionary", type="string",
                     action="callback", callback=arg_dictionary,
                     help="file to read for mcu protocol dictionary")
+    opts.add_option("--import-test", action="store_true",
+                    help="perform an import module test")
     options, args = opts.parse_args()
+    if options.import_test:
+        import_test()
     if len(args) != 1:
         opts.error("Incorrect number of arguments")
-    start_args = {'config_file': args[0], 'start_reason': 'startup'}
+    start_args = {'config_file': args[0], 'apiserver': options.apiserver,
+                  'start_reason': 'startup'}
 
     debuglevel = logging.INFO
     if options.verbose:
@@ -278,31 +341,59 @@ def main():
         start_args['log_file'] = options.logfile
         bglogger = queuelogger.setup_bg_logging(options.logfile, debuglevel)
     else:
-        logging.basicConfig(level=debuglevel)
+        logging.getLogger().setLevel(debuglevel)
     logging.info("Starting Klippy...")
-    start_args['software_version'] = util.get_git_version()
+    git_info = util.get_git_version()
+    git_vers = git_info["version"]
+    extra_files = [fname for code, fname in git_info["file_status"]
+                   if (code in ('??', '!!') and fname.endswith('.py')
+                       and (fname.startswith('klippy/kinematics/')
+                            or fname.startswith('klippy/extras/')))]
+    modified_files = [fname for code, fname in git_info["file_status"]
+                      if code == 'M']
+    extra_git_desc = ""
+    if extra_files:
+        if not git_vers.endswith('-dirty'):
+            git_vers = git_vers + '-dirty'
+        if len(extra_files) > 10:
+            extra_files[10:] = ["(+%d files)" % (len(extra_files) - 10,)]
+        extra_git_desc += "\nUntracked files: %s" % (', '.join(extra_files),)
+    if modified_files:
+        if len(modified_files) > 10:
+            modified_files[10:] = ["(+%d files)" % (len(modified_files) - 10,)]
+        extra_git_desc += "\nModified files: %s" % (', '.join(modified_files),)
+    extra_git_desc += "\nBranch: %s" % (git_info["branch"])
+    extra_git_desc += "\nRemote: %s" % (git_info["remote"])
+    extra_git_desc += "\nTracked URL: %s" % (git_info["url"])
+    start_args['software_version'] = git_vers
     start_args['cpu_info'] = util.get_cpu_info()
     if bglogger is not None:
         versions = "\n".join([
             "Args: %s" % (sys.argv,),
-            "Git version: %s" % (repr(start_args['software_version']),),
+            "Git version: %s%s" % (repr(start_args['software_version']),
+                                   extra_git_desc),
             "CPU: %s" % (start_args['cpu_info'],),
             "Python: %s" % (repr(sys.version),)])
         logging.info(versions)
     elif not options.debugoutput:
         logging.warning("No log file specified!"
                         " Severe timing issues may result!")
+    gc.disable()
 
     # Start Printer() class
     while 1:
         if bglogger is not None:
             bglogger.clear_rollover_info()
             bglogger.set_rollover_info('versions', versions)
-        printer = Printer(bglogger, start_args)
+        gc.collect()
+        main_reactor = reactor.Reactor(gc_checking=True)
+        printer = Printer(main_reactor, bglogger, start_args)
         res = printer.run()
         if res in ['exit', 'error_exit']:
             break
         time.sleep(1.)
+        main_reactor.finalize()
+        main_reactor = printer = None
         logging.info("Restarting printer")
         start_args['start_reason'] = res
 

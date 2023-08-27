@@ -1,16 +1,23 @@
 # Basic LCD display support
 #
-# Copyright (C) 2018-2020  Kevin O'Connor <kevin@koconnor.net>
+# Copyright (C) 2018-2022  Kevin O'Connor <kevin@koconnor.net>
 # Copyright (C) 2018  Aleph Objects, Inc <marcio@alephobjects.com>
 # Copyright (C) 2018  Eric Callahan <arksine.code@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, os, ast
-from . import hd44780, st7920, uc1701, menu
+from . import hd44780, hd44780_spi, st7920, uc1701, menu
+
+# Normal time between each screen redraw
+REDRAW_TIME = 0.500
+# Minimum time between screen redraws
+REDRAW_MIN_TIME = 0.100
 
 LCD_chips = {
-    'st7920': st7920.ST7920, 'hd44780': hd44780.HD44780,
-    'uc1701': uc1701.UC1701, 'ssd1306': uc1701.SSD1306, 'sh1106': uc1701.SH1106,
+    'st7920': st7920.ST7920, 'emulated_st7920': st7920.EmulatedST7920,
+    'hd44780': hd44780.HD44780, 'uc1701': uc1701.UC1701,
+    'ssd1306': uc1701.SSD1306, 'sh1106': uc1701.SH1106,
+    'hd44780_spi': hd44780_spi.hd44780_spi
 }
 
 # Storage of [display_template my_template] config sections
@@ -32,6 +39,8 @@ class DisplayTemplate:
                         option, config.get_name()))
         gcode_macro = self.printer.load_object(config, 'gcode_macro')
         self.template = gcode_macro.load_template(config, 'text')
+    def get_params(self):
+        return self.params
     def render(self, context, **kwargs):
         params = dict(self.params)
         params.update(**kwargs)
@@ -66,52 +75,30 @@ class DisplayGroup:
                 template = gcode_macro.load_template(c, 'text')
                 self.data_items.append((row, col, template))
     def show(self, display, templates, eventtime):
-        swrap = self.data_items[0][2].create_status_wrapper(eventtime)
-        context = { 'printer': swrap,
-                    'draw_progress_bar': display.draw_progress_bar }
+        context = self.data_items[0][2].create_template_context(eventtime)
+        context['draw_progress_bar'] = display.draw_progress_bar
         def render(name, **kwargs):
             return templates[name].render(context, **kwargs)
         context['render'] = render
         for row, col, template in self.data_items:
             text = template.render(context)
             display.draw_text(row, col, text.replace('\n', ''), eventtime)
+        context.clear() # Remove circular references for better gc
 
-class PrinterLCD:
+# Global cache of DisplayTemplate, DisplayGroup, and glyphs
+class PrinterDisplayTemplate:
     def __init__(self, config):
         self.printer = config.get_printer()
-        self.reactor = self.printer.get_reactor()
-        # Load low-level lcd handler
-        self.lcd_chip = config.getchoice('lcd_type', LCD_chips)(config)
-        # Load menu and display_status
-        self.menu = None
-        name = config.get_name()
-        if name == 'display':
-            # only load menu for primary display
-            self.menu = menu.MenuManager(config, self)
-        self.printer.load_object(config, "display_status")
-        # Configurable display
         self.display_templates = {}
         self.display_data_groups = {}
+        self.display_glyphs = {}
         self.load_config(config)
-        dgroup = "_default_16x4"
-        if self.lcd_chip.get_dimensions()[0] == 20:
-            dgroup = "_default_20x4"
-        dgroup = config.get('display_group', dgroup)
-        self.show_data_group = self.display_data_groups.get(dgroup)
-        if self.show_data_group is None:
-            raise config.error("Unknown display_data group '%s'" % (dgroup,))
-        self.printer.register_event_handler("klippy:ready", self.handle_ready)
-        self.screen_update_timer = self.reactor.register_timer(
-            self.screen_update_event)
-        # Register g-code commands
-        gcode = self.printer.lookup_object("gcode")
-        gcode.register_mux_command('SET_DISPLAY_GROUP', 'DISPLAY', name,
-                                   self.cmd_SET_DISPLAY_GROUP,
-                                   desc=self.cmd_SET_DISPLAY_GROUP_help)
-        if name == 'display':
-            gcode.register_mux_command('SET_DISPLAY_GROUP', 'DISPLAY', None,
-                                       self.cmd_SET_DISPLAY_GROUP)
-    # Configurable display
+    def get_display_templates(self):
+        return self.display_templates
+    def get_display_data_groups(self):
+        return self.display_data_groups
+    def get_display_glyphs(self):
+        return self.display_glyphs
     def _parse_glyph(self, config, glyph_name, data, width, height):
         glyph_data = []
         for line in data.split('\n'):
@@ -158,7 +145,7 @@ class PrinterLCD:
             self.display_data_groups[group_name] = dg
         # Load display glyphs
         dg_prefix = 'display_glyph '
-        icons = {}
+        self.display_glyphs = icons = {}
         dg_main = config.get_prefix_sections(dg_prefix)
         dg_main_names = {c.get_name(): 1 for c in dg_main}
         dg_def = [c for c in dconfig.get_prefix_sections(dg_prefix)
@@ -176,37 +163,95 @@ class PrinterLCD:
                 slot = dg.getint('hd44780_slot', minval=0, maxval=7)
                 idata = self._parse_glyph(config, glyph_name, data, 5, 8)
                 icons.setdefault(glyph_name, {})['icon5x8'] = (slot, idata)
-        self.lcd_chip.set_glyphs(icons)
-    # Initialization
+
+def lookup_display_templates(config):
+    printer = config.get_printer()
+    dt = printer.lookup_object("display_template", None)
+    if dt is None:
+        dt = PrinterDisplayTemplate(config)
+        printer.add_object("display_template", dt)
+    return dt
+
+class PrinterLCD:
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        self.reactor = self.printer.get_reactor()
+        # Load low-level lcd handler
+        self.lcd_chip = config.getchoice('lcd_type', LCD_chips)(config)
+        # Load menu and display_status
+        self.menu = None
+        name = config.get_name()
+        if name == 'display':
+            # only load menu for primary display
+            self.menu = menu.MenuManager(config, self)
+        self.printer.load_object(config, "display_status")
+        # Configurable display
+        templates = lookup_display_templates(config)
+        self.display_templates = templates.get_display_templates()
+        self.display_data_groups = templates.get_display_data_groups()
+        self.lcd_chip.set_glyphs(templates.get_display_glyphs())
+        dgroup = "_default_16x4"
+        if self.lcd_chip.get_dimensions()[0] == 20:
+            dgroup = "_default_20x4"
+        dgroup = config.get('display_group', dgroup)
+        self.show_data_group = self.display_data_groups.get(dgroup)
+        if self.show_data_group is None:
+            raise config.error("Unknown display_data group '%s'" % (dgroup,))
+        # Screen updating
+        self.printer.register_event_handler("klippy:ready", self.handle_ready)
+        self.screen_update_timer = self.reactor.register_timer(
+            self.screen_update_event)
+        self.redraw_request_pending = False
+        self.redraw_time = 0.
+        # Register g-code commands
+        gcode = self.printer.lookup_object("gcode")
+        gcode.register_mux_command('SET_DISPLAY_GROUP', 'DISPLAY', name,
+                                   self.cmd_SET_DISPLAY_GROUP,
+                                   desc=self.cmd_SET_DISPLAY_GROUP_help)
+        if name == 'display':
+            gcode.register_mux_command('SET_DISPLAY_GROUP', 'DISPLAY', None,
+                                       self.cmd_SET_DISPLAY_GROUP)
+    def get_dimensions(self):
+        return self.lcd_chip.get_dimensions()
     def handle_ready(self):
         self.lcd_chip.init()
         # Start screen update timer
         self.reactor.update_timer(self.screen_update_timer, self.reactor.NOW)
     # Screen updating
     def screen_update_event(self, eventtime):
+        if self.redraw_request_pending:
+            self.redraw_request_pending = False
+            self.redraw_time = eventtime + REDRAW_MIN_TIME
+        self.lcd_chip.clear()
         # update menu component
         if self.menu is not None:
             ret = self.menu.screen_update_event(eventtime)
             if ret:
-                return ret
+                self.lcd_chip.flush()
+                return eventtime + REDRAW_TIME
         # Update normal display
-        self.lcd_chip.clear()
         try:
             self.show_data_group.show(self, self.display_templates, eventtime)
         except:
             logging.exception("Error during display screen update")
         self.lcd_chip.flush()
-        return eventtime + .500
+        return eventtime + REDRAW_TIME
+    def request_redraw(self):
+        if self.redraw_request_pending:
+            return
+        self.redraw_request_pending = True
+        self.reactor.update_timer(self.screen_update_timer, self.redraw_time)
     def draw_text(self, row, col, mixed_text, eventtime):
         pos = col
         for i, text in enumerate(mixed_text.split('~')):
             if i & 1 == 0:
                 # write text
-                self.lcd_chip.write_text(pos, row, text)
+                self.lcd_chip.write_text(pos, row, text.encode())
                 pos += len(text)
             else:
                 # write glyph
                 pos += self.lcd_chip.write_glyph(pos, row, text)
+        return pos
     def draw_progress_bar(self, row, col, width, value):
         pixels = -1 << int(width * 8 * (1. - value) + .5)
         pixels |= (1 << (width * 8 - 1)) | 1

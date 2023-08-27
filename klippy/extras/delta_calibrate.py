@@ -14,14 +14,7 @@ from . import probe
 
 # Load a stable position from a config entry
 def load_config_stable(config, option):
-    spos = config.get(option)
-    try:
-        sa, sb, sc = map(float, spos.split(','))
-    except:
-        msg = "Unable to parse stable position '%s'" % (spos,)
-        logging.exception(msg)
-        raise config.error(msg)
-    return sa, sb, sc
+    return config.getfloatlist(option, count=3)
 
 
 ######################################################################
@@ -52,7 +45,7 @@ def measurements_to_distances(measured_params, delta_params):
         od - opw
         for od, opw in zip(mp['OUTER_DISTS'], mp['OUTER_PILLAR_WIDTHS']) ]
     # Convert angles in degrees to an XY multiplier
-    obj_angles = map(math.radians, MeasureAngles)
+    obj_angles = list(map(math.radians, MeasureAngles))
     xy_angles = list(zip(map(math.cos, obj_angles), map(math.sin, obj_angles)))
     # Calculate stable positions for center measurements
     inner_ridge = MeasureRidgeRadius * scale
@@ -90,12 +83,10 @@ class DeltaCalibrate:
         # Calculate default probing points
         radius = config.getfloat('radius', above=0.)
         points = [(0., 0.)]
-        
-        extra_count = config.getint('samples', 6, minval=2)
-        
-        for i in range(extra_count):
-            r = math.radians(90. + (360. / extra_count) * i)
-            dist = radius
+        scatter = [.95, .90, .85, .70, .75, .80]
+        for i in range(6):
+            r = math.radians(90. + 60. * i)
+            dist = radius * scatter[i]
             points.append((math.cos(r) * dist, math.sin(r) * dist))
         self.probe_helper = probe.ProbePointsHelper(
             config, self.probe_finalize, default_points=points)
@@ -184,21 +175,25 @@ class DeltaCalibrate:
             z_weight = len(distances) / (MEASURE_WEIGHT * len(probe_positions))
         # Perform coordinate descent
         def delta_errorfunc(params):
-            # Build new delta_params for params under test
-            delta_params = orig_delta_params.new_calibration(params)
-            # Calculate z height errors
-            total_error = 0.
-            for z_offset, stable_pos in height_positions:
-                x, y, z = delta_params.get_position_from_stable(stable_pos)
-                total_error += (z - z_offset)**2
-            total_error *= z_weight
-            # Calculate distance errors
-            for dist, stable_pos1, stable_pos2 in distances:
-                x1, y1, z1 = delta_params.get_position_from_stable(stable_pos1)
-                x2, y2, z2 = delta_params.get_position_from_stable(stable_pos2)
-                d = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
-                total_error += (d - dist)**2
-            return total_error
+            try:
+                # Build new delta_params for params under test
+                delta_params = orig_delta_params.new_calibration(params)
+                getpos = delta_params.get_position_from_stable
+                # Calculate z height errors
+                total_error = 0.
+                for z_offset, stable_pos in height_positions:
+                    x, y, z = getpos(stable_pos)
+                    total_error += (z - z_offset)**2
+                total_error *= z_weight
+                # Calculate distance errors
+                for dist, stable_pos1, stable_pos2 in distances:
+                    x1, y1, z1 = getpos(stable_pos1)
+                    x2, y2, z2 = getpos(stable_pos2)
+                    d = math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
+                    total_error += (d - dist)**2
+                return total_error
+            except ValueError:
+                return 9999999999999.9
         new_params = mathutil.background_coordinate_descent(
             self.printer, adj_params, params, delta_errorfunc)
         # Log and report results
@@ -226,23 +221,28 @@ class DeltaCalibrate:
     cmd_DELTA_CALIBRATE_help = "Delta calibration script"
     def cmd_DELTA_CALIBRATE(self, gcmd):
         self.probe_helper.start_probe(gcmd)
-        
+
         sum = 0
         count = len(self.probe_helper.results)
+
+        if count <= 0:
+          return
+
         for i in range(count):
             x = self.probe_helper.results[i][0]
             y = self.probe_helper.results[i][1]
             z = self.probe_helper.results[i][2]
-            self.gcode.respond_info("%2d. x:%.2f, y:%.2f, z : %.6f" % (i, x, y, z))
+            self.gcode.respond_info\
+              ("%2d. x:%.2f, y:%.2f, z : %.6f" % (i, x, y, z))
             sum += z
         avg = sum / count
-        
+
         sd_sum = 0
         for i in range(count):
             z = self.probe_helper.results[i][2]
             sd_sum += pow(z - avg, 2.)
         sd = (sd_sum / count) ** 0.5
-        
+
         self.gcode.respond_info("probe count : %d" % (count))
         self.gcode.respond_info("average : %.6f" % (avg))
         self.gcode.respond_info("stdev : %.6f" % (sd))
@@ -251,9 +251,9 @@ class DeltaCalibrate:
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
         kin = toolhead.get_kinematics()
-        for s in kin.get_steppers():
-            s.set_tag_position(s.get_commanded_position())
-        kin_pos = kin.calc_tag_position()
+        kin_spos = {s.get_name(): s.get_commanded_position()
+                    for s in kin.get_steppers()}
+        kin_pos = kin.calc_position(kin_spos)
         # Convert location to a stable position
         delta_params = kin.get_calibration()
         stable_pos = tuple(delta_params.calc_stable_position(kin_pos))
